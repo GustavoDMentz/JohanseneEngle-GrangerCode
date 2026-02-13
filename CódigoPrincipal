@@ -1,0 +1,96 @@
+import ccxt
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.stattools import coint
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from joblib import Parallel, delayed
+from datetime import datetime, timedelta
+import itertools
+import time
+
+# --- 1. CONFIGURAÇÃO E TRIAGEM ---
+def realizar_triage(exchange, min_anos=2):
+    print(f"🔍 Iniciando triagem de pares com {min_anos} anos de histórico...")
+    markets = exchange.load_markets()
+    data_limite = datetime.now() - timedelta(days=min_anos * 365)
+    ts_limite = int(data_limite.timestamp() * 1000)
+    
+    pares_usdt = [s for s in markets if '/USDT' in s and markets[s]['active']]
+    pares_qualificados = []
+    
+    for symbol in pares_usdt[:150]: # Limitado para teste, remova [:150] para os 900+
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1d', since=0, limit=1)
+            if ohlcv and ohlcv[0][0] <= ts_limite:
+                pares_qualificados.append(symbol)
+        except: continue
+    return pares_qualificados
+
+# --- 2. DOWNLOAD DOS DADOS ---
+def baixar_precos(exchange, lista_simbolos):
+    dados = {}
+    since = exchange.milliseconds() - (730 * 24 * 60 * 60 * 1000) # 2 anos
+    print(f"📥 Baixando {len(lista_simbolos)} ativos (OHLCV 1h)...")
+    
+    for symbol in lista_simbolos:
+        try:
+            all_ohlcv = []
+            curr_since = since
+            while curr_since < exchange.milliseconds():
+                ohlcv = exchange.fetch_ohlcv(symbol, '1h', curr_since, limit=1000)
+                if not ohlcv: break
+                curr_since = ohlcv[-1][0] + 1
+                all_ohlcv += ohlcv
+            
+            if all_ohlcv:
+                df_t = pd.DataFrame(all_ohlcv, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                dados[symbol] = pd.Series(df_t['c'].values, index=pd.to_datetime(df_t['ts'], unit='ms'))
+            time.sleep(exchange.rateLimit / 1000)
+        except: continue
+    return pd.DataFrame(dados)
+
+# --- 3. TESTE ATÔMICO (O QUE VAI PARA A GPU/MULTICORE) ---
+def testar_par_unico(s1, s2, df):
+    try:
+        par_data = df[[s1, s2]].dropna()
+        if len(par_data) < 4000: return None
+
+        # Engle-Granger
+        _, p_value_eg, _ = coint(par_data[s1], par_data[s2])
+        # Johansen
+        res_j = coint_johansen(par_data, det_order=0, k_ar_diff=1)
+        
+        if p_value_eg < 0.05 and res_j.lr1[0] > res_j.cvt[0, 1]:
+            return {
+                'Par': f"{s1} vs {s2}",
+                'Amostra': len(par_data),
+                'P-Value_EG': round(p_value_eg, 4),
+                'Johansen_Stat': round(res_j.lr1[0], 2),
+                'Status': 'Aprovado'
+            }
+    except: return None
+    return None
+
+# --- EXECUÇÃO PRINCIPAL ---
+exchange = ccxt.kucoin({'enableRateLimit': True})
+
+# Passo 1: Triagem (Gera o df_triagem que faltava)
+simbolos_84 = realizar_triage(exchange)
+
+# Passo 2: Download
+df_precos = baixar_precos(exchange, simbolos_84)
+
+# Passo 3: Processamento em Paralelo (All Cores!)
+if not df_precos.empty:
+    combinacoes = list(itertools.combinations(df_precos.columns, 2))
+    print(f"🚀 Processando {len(combinacoes)} combinações em paralelo...")
+    
+    # n_jobs=-1 ativa todos os seus núcleos
+    resultados = Parallel(n_jobs=-1, verbose=5)(
+        delayed(testar_par_unico)(s1, s2, df_precos) for s1, s2 in combinacoes
+    )
+    
+    df_validacao = pd.DataFrame([r for r in resultados if r is not None])
+    df_validacao.to_csv('pares_elite_kucoin.csv', index=False)
+    print("\n=== TOP PARES COINTEGRADOS ===")
+    print(df_validacao.sort_values('P-Value_EG').head(15))
